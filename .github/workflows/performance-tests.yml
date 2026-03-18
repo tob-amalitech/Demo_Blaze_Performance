@@ -19,6 +19,7 @@ on:
         options:
           - baseline
           - load
+          - peak-load
           - stress
           - endurance
           - all
@@ -406,12 +407,337 @@ jobs:
           EOF
 
   # =====================================================================
-  # JOB 3: STRESS TEST (300 Users)
+  # JOB 3: PEAK LOAD TEST (300 Users)
   # =====================================================================
-  stress-test:
-    name: Stress Test (300 Users)
+  peak-load-test:
+    name: Peak Load Test (300 Users)
     runs-on: ubuntu-latest
     needs: load-test
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.test_type == 'peak-load' ||
+      github.event.inputs.test_type == 'all'))
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache JMeter
+        id: cache-jmeter
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JMETER_HOME }}
+          key: jmeter-${{ env.JMETER_VERSION }}
+
+      - name: Install JMeter
+        if: steps.cache-jmeter.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          tar -xzf apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          sudo mv apache-jmeter-${{ env.JMETER_VERSION }} ${{ env.JMETER_HOME }}
+
+      - name: Create Directories
+        run: mkdir -p results reports/peak-load
+
+      - name: Run Peak Load Test
+        run: |
+          ${{ env.JMETER_HOME }}/bin/jmeter \
+            -n \
+            -t DemoBlaze_PerformanceTest.jmx \
+            -l results/demoblaze_peakload.jtl \
+            -e \
+            -o reports/peak-load \
+            -JUSERNAME=${{ secrets.DEMOBLAZE_USERNAME }} \
+            -JPASSWORD=${{ secrets.DEMOBLAZE_PASSWORD }}
+        continue-on-error: true
+
+      - name: Check Error Rate
+        id: error_check
+        run: |
+          python3 << 'EOF'
+          import csv, sys, os
+          total = errors = 0
+          try:
+              with open("results/demoblaze_peakload.jtl") as f:
+                  for row in csv.DictReader(f):
+                      total += 1
+                      if row.get("success","").lower() == "false":
+                          errors += 1
+          except FileNotFoundError:
+              sys.exit(0)
+          rate = (errors/total)*100 if total > 0 else 0
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"error_rate={rate:.2f}\n")
+              f.write(f"total_requests={total}\n")
+              f.write(f"status={'PASS' if rate <= 1.0 else 'FAIL'}\n")
+          print(f"Total: {total} | Error Rate: {rate:.2f}%")
+          EOF
+
+      - name: Upload Peak Load Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: peak-load-html-report
+          path: reports/peak-load/
+          retention-days: 30
+
+      # ── SLACK NOTIFICATION ──────────────────────────────────────────
+      - name: Notify Slack - Peak Load Test Result
+        if: always()
+        run: |
+          STATUS="${{ steps.error_check.outputs.status }}"
+          ERROR_RATE="${{ steps.error_check.outputs.error_rate }}"
+          TOTAL="${{ steps.error_check.outputs.total_requests }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COLOR=$( [ "$STATUS" = "PASS" ] && echo "good" || echo "danger" )
+          EMOJI=$( [ "$STATUS" = "PASS" ] && echo ":white_check_mark:" || echo ":x:" )
+
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"$EMOJI QAM010 - DemoBlaze Peak Load Test (300 Users) - $STATUS\",
+                \"fields\": [
+                  {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                  {\"title\": \"Error Rate\", \"value\": \"${ERROR_RATE}%\", \"short\": true},
+                  {\"title\": \"Total Requests\", \"value\": \"$TOTAL\", \"short\": true},
+                  {\"title\": \"Breaking Point Note\", \"value\": \"Peak load test — sustained at max expected traffic\", \"short\": false}
+                ],
+                \"footer\": \"GitHub Actions | DemoBlaze Performance Tests\",
+                \"ts\": $(date +%s)
+              }]
+            }"
+
+      # ── GMAIL NOTIFICATION ──────────────────────────────────────────
+      - name: Notify Gmail - Peak Load Test Result
+        if: always()
+        run: |
+          python3 << EOF
+          import smtplib
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+
+          status = "${{ steps.error_check.outputs.status }}"
+          error_rate = "${{ steps.error_check.outputs.error_rate }}"
+          total = "${{ steps.error_check.outputs.total_requests }}"
+          run_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          emoji = "✅" if status == "PASS" else "❌"
+          color = "#2ECC71" if status == "PASS" else "#E74C3C"
+
+          subject = f"{emoji} QAM010 DemoBlaze | Peak Load Test (300 Users) - {status}"
+          html = f"""
+          <html><body style="font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5;">
+            <div style="max-width: 600px; margin: auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+              <div style="background: {color}; padding: 20px; text-align: center;">
+                <h1 style="color: white; margin: 0;">{emoji} Peak Load Test - {status}</h1>
+                <p style="color: white; margin: 5px 0;">QAM010 - DemoBlaze Performance Testing</p>
+              </div>
+              <div style="padding: 30px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Test Phase</td><td style="padding:12px;border:1px solid #dee2e6;">Peak Load - 300 Concurrent Users</td></tr>
+                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Total Requests</td><td style="padding:12px;border:1px solid #dee2e6;">{total}</td></tr>
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Error Rate</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{error_rate}%</td></tr>
+                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Status</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{status}</td></tr>
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Note</td><td style="padding:12px;border:1px solid #dee2e6;">Sustained at max expected traffic — high error rate may indicate system limits</td></tr>
+                </table>
+                <div style="text-align:center;margin-top:25px;">
+                  <a href="{run_url}" style="background:#2E4B8F;color:white;padding:12px 30px;text-decoration:none;border-radius:5px;font-weight:bold;">View Full Run on GitHub</a>
+                </div>
+              </div>
+            </div>
+          </body></html>
+          """
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = subject
+          msg["From"] = "${{ secrets.MAIL_USERNAME }}"
+          msg["To"] = "${{ secrets.MAIL_RECIPIENT }}"
+          msg.attach(MIMEText(html, "html"))
+          try:
+              with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                  server.login("${{ secrets.MAIL_USERNAME }}", "${{ secrets.MAIL_PASSWORD }}")
+                  server.sendmail("${{ secrets.MAIL_USERNAME }}", "${{ secrets.MAIL_RECIPIENT }}", msg.as_string())
+              print("Email sent successfully")
+          except Exception as e:
+              print(f"Email failed: {e}")
+          EOF
+
+  # =====================================================================
+  # JOB 4: ENDURANCE TEST (200 Users / 60 min)
+  # =====================================================================
+  endurance-test:
+    name: Endurance Test (200 Users / 60 min)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.test_type == 'endurance' ||
+      github.event.inputs.test_type == 'all'))
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache JMeter
+        id: cache-jmeter
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JMETER_HOME }}
+          key: jmeter-${{ env.JMETER_VERSION }}
+
+      - name: Install JMeter
+        if: steps.cache-jmeter.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          tar -xzf apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          sudo mv apache-jmeter-${{ env.JMETER_VERSION }} ${{ env.JMETER_HOME }}
+
+      - name: Create Directories
+        run: mkdir -p results reports/endurance
+
+      - name: Run Endurance Test
+        run: |
+          ${{ env.JMETER_HOME }}/bin/jmeter \
+            -n \
+            -t DemoBlaze_PerformanceTest.jmx \
+            -l results/demoblaze_endurance.jtl \
+            -e \
+            -o reports/endurance \
+            -Jduration=3600 \
+            -JUSERNAME=${{ secrets.DEMOBLAZE_USERNAME }} \
+            -JPASSWORD=${{ secrets.DEMOBLAZE_PASSWORD }}
+        continue-on-error: true
+
+      - name: Check Error Rate
+        id: error_check
+        run: |
+          python3 << 'EOF'
+          import csv, sys, os
+          total = errors = 0
+          try:
+              with open("results/demoblaze_endurance.jtl") as f:
+                  for row in csv.DictReader(f):
+                      total += 1
+                      if row.get("success","").lower() == "false":
+                          errors += 1
+          except FileNotFoundError:
+              sys.exit(0)
+          rate = (errors/total)*100 if total > 0 else 0
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"error_rate={rate:.2f}\n")
+              f.write(f"total_requests={total}\n")
+              f.write(f"status={'PASS' if rate <= 1.0 else 'FAIL'}\n")
+          print(f"Total: {total} | Error Rate: {rate:.2f}%")
+          EOF
+
+      - name: Upload Endurance Test Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: endurance-test-html-report
+          path: reports/endurance/
+          retention-days: 30
+
+      # ── SLACK NOTIFICATION ──────────────────────────────────────────
+      - name: Notify Slack - Endurance Test Result
+        if: always()
+        run: |
+          STATUS="${{ steps.error_check.outputs.status }}"
+          ERROR_RATE="${{ steps.error_check.outputs.error_rate }}"
+          TOTAL="${{ steps.error_check.outputs.total_requests }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COLOR=$( [ "$STATUS" = "PASS" ] && echo "good" || echo "danger" )
+          EMOJI=$( [ "$STATUS" = "PASS" ] && echo ":white_check_mark:" || echo ":x:" )
+
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"$EMOJI QAM010 - DemoBlaze Endurance Test (200 Users / 60 min) - $STATUS\",
+                \"fields\": [
+                  {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                  {\"title\": \"Error Rate\", \"value\": \"${ERROR_RATE}%\", \"short\": true},
+                  {\"title\": \"Total Requests\", \"value\": \"$TOTAL\", \"short\": true},
+                  {\"title\": \"Duration\", \"value\": \"60 minutes sustained load\", \"short\": true}
+                ],
+                \"footer\": \"GitHub Actions | DemoBlaze Performance Tests\",
+                \"ts\": $(date +%s)
+              }]
+            }"
+
+      # ── GMAIL NOTIFICATION ──────────────────────────────────────────
+      - name: Notify Gmail - Endurance Test Result
+        if: always()
+        run: |
+          python3 << EOF
+          import smtplib
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+
+          status = "${{ steps.error_check.outputs.status }}"
+          error_rate = "${{ steps.error_check.outputs.error_rate }}"
+          total = "${{ steps.error_check.outputs.total_requests }}"
+          run_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          emoji = "✅" if status == "PASS" else "❌"
+          color = "#2ECC71" if status == "PASS" else "#E74C3C"
+
+          subject = f"{emoji} QAM010 DemoBlaze | Endurance Test (200 Users / 60 min) - {status}"
+          html = f"""
+          <html><body style="font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5;">
+            <div style="max-width: 600px; margin: auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+              <div style="background: {color}; padding: 20px; text-align: center;">
+                <h1 style="color: white; margin: 0;">{emoji} Endurance Test - {status}</h1>
+                <p style="color: white; margin: 5px 0;">QAM010 - DemoBlaze Performance Testing</p>
+              </div>
+              <div style="padding: 30px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Test Phase</td><td style="padding:12px;border:1px solid #dee2e6;">Endurance - 200 Users / 60 Minutes</td></tr>
+                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Total Requests</td><td style="padding:12px;border:1px solid #dee2e6;">{total}</td></tr>
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Error Rate</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{error_rate}%</td></tr>
+                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Status</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{status}</td></tr>
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Stability</td><td style="padding:12px;border:1px solid #dee2e6;">Sustained load test to check for memory leaks and degradation over 60 minutes</td></tr>
+                </table>
+                <div style="text-align:center;margin-top:25px;">
+                  <a href="{run_url}" style="background:#2E4B8F;color:white;padding:12px 30px;text-decoration:none;border-radius:5px;font-weight:bold;">View Full Run on GitHub</a>
+                </div>
+              </div>
+            </div>
+          </body></html>
+          """
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = subject
+          msg["From"] = "${{ secrets.MAIL_USERNAME }}"
+          msg["To"] = "${{ secrets.MAIL_RECIPIENT }}"
+          msg.attach(MIMEText(html, "html"))
+          try:
+              with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                  server.login("${{ secrets.MAIL_USERNAME }}", "${{ secrets.MAIL_PASSWORD }}")
+                  server.sendmail("${{ secrets.MAIL_USERNAME }}", "${{ secrets.MAIL_RECIPIENT }}", msg.as_string())
+              print("Email sent successfully")
+          except Exception as e:
+              print(f"Email failed: {e}")
+          EOF
+  # =====================================================================
+  # JOB 5: STRESS TEST (500 Users)
+  # =====================================================================
+  stress-test:
+    name: Stress Test (500 Users)
+    runs-on: ubuntu-latest
+    needs: peak-load-test
     if: |
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' &&
@@ -475,8 +801,13 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"error_rate={rate:.2f}\n")
               f.write(f"total_requests={total}\n")
-              f.write(f"status={'PASS' if rate <= 1.0 else 'FAIL'}\n")
+              f.write(f"status={'PASS' if rate <= 5.0 else 'FAIL'}\n")
           print(f"Total: {total} | Error Rate: {rate:.2f}%")
+          if rate > 5.0:
+              print(f"FAIL: Error rate {rate:.2f}% exceeds 5% stress threshold")
+              sys.exit(1)
+          else:
+              print("PASS: Within acceptable stress threshold")
           EOF
 
       - name: Upload Stress Test Report
@@ -503,12 +834,13 @@ jobs:
             -d "{
               \"attachments\": [{
                 \"color\": \"$COLOR\",
-                \"title\": \"$EMOJI QAM010 - DemoBlaze Stress Test (300 Users) - $STATUS\",
+                \"title\": \"$EMOJI QAM010 - DemoBlaze Stress Test (500 Users) - $STATUS\",
                 \"fields\": [
                   {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
                   {\"title\": \"Error Rate\", \"value\": \"${ERROR_RATE}%\", \"short\": true},
                   {\"title\": \"Total Requests\", \"value\": \"$TOTAL\", \"short\": true},
-                  {\"title\": \"Breaking Point Note\", \"value\": \"Stress test may exceed 1% threshold - expected behavior\", \"short\": false}
+                  {\"title\": \"Threshold\", \"value\": \"< 5% (stress tolerance)\", \"short\": true},
+                  {\"title\": \"Breaking Point Note\", \"value\": \"500 users — pushes system beyond normal limits to identify breaking point\", \"short\": false}
                 ],
                 \"footer\": \"GitHub Actions | DemoBlaze Performance Tests\",
                 \"ts\": $(date +%s)
@@ -531,7 +863,7 @@ jobs:
           emoji = "✅" if status == "PASS" else "❌"
           color = "#2ECC71" if status == "PASS" else "#E74C3C"
 
-          subject = f"{emoji} QAM010 DemoBlaze | Stress Test (300 Users) - {status}"
+          subject = f"{emoji} QAM010 DemoBlaze | Stress Test (500 Users) - {status}"
           html = f"""
           <html><body style="font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5;">
             <div style="max-width: 600px; margin: auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
@@ -541,174 +873,12 @@ jobs:
               </div>
               <div style="padding: 30px;">
                 <table style="width: 100%; border-collapse: collapse;">
-                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Test Phase</td><td style="padding:12px;border:1px solid #dee2e6;">Stress Test - 300 Concurrent Users</td></tr>
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Test Phase</td><td style="padding:12px;border:1px solid #dee2e6;">Stress Test - 500 Concurrent Users</td></tr>
                   <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Total Requests</td><td style="padding:12px;border:1px solid #dee2e6;">{total}</td></tr>
                   <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Error Rate</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{error_rate}%</td></tr>
-                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Status</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{status}</td></tr>
-                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Note</td><td style="padding:12px;border:1px solid #dee2e6;">High error rate at stress level is expected — identifies breaking point</td></tr>
-                </table>
-                <div style="text-align:center;margin-top:25px;">
-                  <a href="{run_url}" style="background:#2E4B8F;color:white;padding:12px 30px;text-decoration:none;border-radius:5px;font-weight:bold;">View Full Run on GitHub</a>
-                </div>
-              </div>
-            </div>
-          </body></html>
-          """
-          msg = MIMEMultipart("alternative")
-          msg["Subject"] = subject
-          msg["From"] = "${{ secrets.MAIL_USERNAME }}"
-          msg["To"] = "${{ secrets.MAIL_RECIPIENT }}"
-          msg.attach(MIMEText(html, "html"))
-          try:
-              with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                  server.login("${{ secrets.MAIL_USERNAME }}", "${{ secrets.MAIL_PASSWORD }}")
-                  server.sendmail("${{ secrets.MAIL_USERNAME }}", "${{ secrets.MAIL_RECIPIENT }}", msg.as_string())
-              print("Email sent successfully")
-          except Exception as e:
-              print(f"Email failed: {e}")
-          EOF
-
-  # =====================================================================
-  # JOB 4: ENDURANCE TEST (100 Users / 5 min)
-  # =====================================================================
-  endurance-test:
-    name: Endurance Test (100 Users / 5 min)
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.test_type == 'endurance' ||
-      github.event.inputs.test_type == 'all'))
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Cache JMeter
-        id: cache-jmeter
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.JMETER_HOME }}
-          key: jmeter-${{ env.JMETER_VERSION }}
-
-      - name: Install JMeter
-        if: steps.cache-jmeter.outputs.cache-hit != 'true'
-        run: |
-          wget -q https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${{ env.JMETER_VERSION }}.tgz
-          tar -xzf apache-jmeter-${{ env.JMETER_VERSION }}.tgz
-          sudo mv apache-jmeter-${{ env.JMETER_VERSION }} ${{ env.JMETER_HOME }}
-
-      - name: Create Directories
-        run: mkdir -p results reports/endurance
-
-      - name: Run Endurance Test
-        run: |
-          ${{ env.JMETER_HOME }}/bin/jmeter \
-            -n \
-            -t DemoBlaze_PerformanceTest.jmx \
-            -l results/demoblaze_endurance.jtl \
-            -e \
-            -o reports/endurance \
-            -Jduration=300 \
-            -JUSERNAME=${{ secrets.DEMOBLAZE_USERNAME }} \
-            -JPASSWORD=${{ secrets.DEMOBLAZE_PASSWORD }}
-        continue-on-error: true
-
-      - name: Check Error Rate
-        id: error_check
-        run: |
-          python3 << 'EOF'
-          import csv, sys, os
-          total = errors = 0
-          try:
-              with open("results/demoblaze_endurance.jtl") as f:
-                  for row in csv.DictReader(f):
-                      total += 1
-                      if row.get("success","").lower() == "false":
-                          errors += 1
-          except FileNotFoundError:
-              sys.exit(0)
-          rate = (errors/total)*100 if total > 0 else 0
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"error_rate={rate:.2f}\n")
-              f.write(f"total_requests={total}\n")
-              f.write(f"status={'PASS' if rate <= 1.0 else 'FAIL'}\n")
-          print(f"Total: {total} | Error Rate: {rate:.2f}%")
-          EOF
-
-      - name: Upload Endurance Test Report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: endurance-test-html-report
-          path: reports/endurance/
-          retention-days: 30
-
-      # ── SLACK NOTIFICATION ──────────────────────────────────────────
-      - name: Notify Slack - Endurance Test Result
-        if: always()
-        run: |
-          STATUS="${{ steps.error_check.outputs.status }}"
-          ERROR_RATE="${{ steps.error_check.outputs.error_rate }}"
-          TOTAL="${{ steps.error_check.outputs.total_requests }}"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          COLOR=$( [ "$STATUS" = "PASS" ] && echo "good" || echo "danger" )
-          EMOJI=$( [ "$STATUS" = "PASS" ] && echo ":white_check_mark:" || echo ":x:" )
-
-          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"attachments\": [{
-                \"color\": \"$COLOR\",
-                \"title\": \"$EMOJI QAM010 - DemoBlaze Endurance Test (100 Users / 5 min) - $STATUS\",
-                \"fields\": [
-                  {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
-                  {\"title\": \"Error Rate\", \"value\": \"${ERROR_RATE}%\", \"short\": true},
-                  {\"title\": \"Total Requests\", \"value\": \"$TOTAL\", \"short\": true},
-                  {\"title\": \"Duration\", \"value\": \"5 minutes sustained load\", \"short\": true}
-                ],
-                \"footer\": \"GitHub Actions | DemoBlaze Performance Tests\",
-                \"ts\": $(date +%s)
-              }]
-            }"
-
-      # ── GMAIL NOTIFICATION ──────────────────────────────────────────
-      - name: Notify Gmail - Endurance Test Result
-        if: always()
-        run: |
-          python3 << EOF
-          import smtplib
-          from email.mime.multipart import MIMEMultipart
-          from email.mime.text import MIMEText
-
-          status = "${{ steps.error_check.outputs.status }}"
-          error_rate = "${{ steps.error_check.outputs.error_rate }}"
-          total = "${{ steps.error_check.outputs.total_requests }}"
-          run_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          emoji = "✅" if status == "PASS" else "❌"
-          color = "#2ECC71" if status == "PASS" else "#E74C3C"
-
-          subject = f"{emoji} QAM010 DemoBlaze | Endurance Test (100 Users / 5 min) - {status}"
-          html = f"""
-          <html><body style="font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5;">
-            <div style="max-width: 600px; margin: auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-              <div style="background: {color}; padding: 20px; text-align: center;">
-                <h1 style="color: white; margin: 0;">{emoji} Endurance Test - {status}</h1>
-                <p style="color: white; margin: 5px 0;">QAM010 - DemoBlaze Performance Testing</p>
-              </div>
-              <div style="padding: 30px;">
-                <table style="width: 100%; border-collapse: collapse;">
-                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Test Phase</td><td style="padding:12px;border:1px solid #dee2e6;">Endurance - 100 Users / 5 Minutes</td></tr>
-                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Total Requests</td><td style="padding:12px;border:1px solid #dee2e6;">{total}</td></tr>
-                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Error Rate</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{error_rate}%</td></tr>
-                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Status</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{status}</td></tr>
-                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Stability</td><td style="padding:12px;border:1px solid #dee2e6;">Sustained load test to check for memory leaks and degradation</td></tr>
+                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Threshold</td><td style="padding:12px;border:1px solid #dee2e6;">Less than 5% (stress tolerance)</td></tr>
+                  <tr style="background:#f8f9fa;"><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Status</td><td style="padding:12px;border:1px solid #dee2e6;color:{color};font-weight:bold;">{status}</td></tr>
+                  <tr><td style="padding:12px;border:1px solid #dee2e6;font-weight:bold;">Note</td><td style="padding:12px;border:1px solid #dee2e6;">Extreme load — identifies system breaking point beyond peak capacity</td></tr>
                 </table>
                 <div style="text-align:center;margin-top:25px;">
                   <a href="{run_url}" style="background:#2E4B8F;color:white;padding:12px 30px;text-decoration:none;border-radius:5px;font-weight:bold;">View Full Run on GitHub</a>
